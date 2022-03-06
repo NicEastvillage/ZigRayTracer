@@ -35,7 +35,7 @@ const ones = Vec3{ .x = 1, .y = 1, .z = 1 };
 //--------------------------------------------------------------------------------------
 const screen_width = 1280;
 const screen_height = 680;
-const samples_per_pixel = 4;
+const samples_per_pixel = 40;
 const sphere_count = 130;
 const max_depth = 8;
 const thread_count = 14;
