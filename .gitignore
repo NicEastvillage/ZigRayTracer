@@ -7,3 +7,5 @@ zig-out/
 /docgen_tmp/
 
 raylib.lib
+*.sublime-workspace
+*.sublime-project
