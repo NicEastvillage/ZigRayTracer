@@ -35,9 +35,8 @@ const ones = Vec3{ .x = 1, .y = 1, .z = 1 };
 //--------------------------------------------------------------------------------------
 const screen_width = 1280;
 const screen_height = 680;
-const samples_per_pixel = 40;
-const sphere_count = 130;
-const max_depth = 8;
+const sphere_count = 100;
+const max_depth = 5;
 const thread_count = 14;
 const sky_color = Vec3{ .x = 0.4, .y = 0.55, .z = 0.92 };
 const ground_color = Vec3{ .x = 0.8, .y = 0.6, .z = 0.5 };
@@ -82,11 +81,11 @@ fn colorToVec3(col: Color) Vec3 {
     return Vec3{ .x = @intToFloat(f32, col.r) / 255.0, .y = @intToFloat(f32, col.g) / 255.0, .z = @intToFloat(f32, col.b) / 255.0 };
 }
 
-fn vec3ToColor(vec: Vec3, samples: u32) Color {
-    const s = @intToFloat(f32, samples);
+fn vec3ToColor(vec: Vec3, sample: u32) Color {
+    const a = 255.0 / (1.0 + @intToFloat(f32, sample));
     // We take the square root to gamma correct with gamma=2
-    const v = minV(maxV(zeroes, scale(sqrtV(scale(vec, 1.0 / s)), 255.0)), Vec3{ .x = 255, .y = 255, .z = 255 });
-    return Color{ .r = @floatToInt(u8, v.x), .g = @floatToInt(u8, v.y), .b = @floatToInt(u8, v.z), .a = 255 };
+    const v = minV(maxV(zeroes, scale(sqrtV(vec), 255.0)), Vec3{ .x = 255, .y = 255, .z = 255 });
+    return Color{ .r = @floatToInt(u8, v.x), .g = @floatToInt(u8, v.y), .b = @floatToInt(u8, v.z), .a = @floatToInt(u8, a) };
 }
 
 fn sign(comptime T: type, num: T) T {
@@ -196,24 +195,24 @@ fn rayColor(ray: Ray, spheres: []const Sphere, depth: u32) Vec3 {
 }
 
 /// Renders the scanlines from v0 to v1
-fn renderSection(img_buffer: []Color, v0: i32, v1: i32, spheres: []const Sphere, cam: *const rl.Camera3D) void {
-    var u: i32 = 0;
-    while (u < screen_width) : (u += 1) {
+fn renderSection(running: *bool, img_buffer: []Color, v0: i32, v1: i32, spheres: []const Sphere, cam: *const rl.Camera3D) void {
+    var sample: u32 = 0;
+    while (running.*) : (sample += 1) {
         var v: i32 = v0;
         while (v < v1) : (v += 1) {
-            const uf = @intToFloat(f32, u);
-            const vf = @intToFloat(f32, screen_height - v - 1);
-            var col = zeroes;
-            // Make multiple samples per pixel with slight offset to achieve anti-aliasing
-            var i: i32 = 0;
-            while (i < samples_per_pixel) : (i += 1) {
+            var u: i32 = 0;
+            while (u < screen_width) : (u += 1) {
+                const i = @intCast(usize, u + v * screen_width);
+                const uf = @intToFloat(f32, u);
+                const vf = @intToFloat(f32, screen_height - v - 1);
+
                 const du = rng.random().float(f32);
                 const dv = rng.random().float(f32);
                 const ray = rl.GetMouseRay(rl.Vector2{ .x = uf + du, .y = vf + dv }, cam.*);
-                col = add(col, rayColor(ray, spheres, max_depth));
+                const color = vec3ToColor(rayColor(ray, spheres, max_depth), sample);
+
+                img_buffer[i] = rl.ColorAlphaBlend(img_buffer[i], color, rl.WHITE);
             }
-            const c = vec3ToColor(col, samples_per_pixel);
-            img_buffer[@intCast(usize, u + v * screen_width)] = c;
         }
     }
 }
@@ -300,42 +299,46 @@ pub fn main() anyerror!void {
     var threads: [thread_count]Thread = undefined;
     const renderTimer = try Timer.start();
 
-    // Start threads - each is tasked with a section of the buffer
+    // Start threads - each is tasked with a section of the buffer'
+    var running = true;
     var tid: i32 = 0;
     while (tid < thread_count) : (tid += 1) {
         const v0 = tid * sectionHeight;
         const v1 = if (tid == thread_count - 1) screen_height else tid * sectionHeight + sectionHeight;
         print("Thread {} will render v={}..{}\n", .{ tid, v0, v1 });
-        threads[@intCast(usize, tid)] = try Thread.spawn(.{}, renderSection, .{ img_buffer[0..], v0, v1, spheres[0..], &cam });
-    }
-
-    // Wait for rendering to finish
-    for (threads) |thread| {
-        thread.join();
+        threads[@intCast(usize, tid)] = try Thread.spawn(.{}, renderSection, .{ &running, img_buffer[0..], v0, v1, spheres[0..], &cam });
     }
 
     // Draw buffer on texture
     var texture = rl.LoadRenderTexture(screen_width, screen_height);
-    texture.Begin();
-    var u: i32 = 0;
-    while (u < screen_width) : (u += 1) {
-        var v: i32 = 0;
-        while (v < screen_height) : (v += 1) {
-            const c = img_buffer[@intCast(usize, u + v * screen_width)];
-            rl.DrawPixel(u, v, c);
-        }
-    }
-    texture.End();
+    defer rl.UnloadRenderTexture(texture);
 
     print("Finished rendering in {d:.3} seconds\n", .{0.000000001 * @intToFloat(f32, renderTimer.read())});
 
     // Main loop
     //--------------------------------------------------------------------------------------
     while (!rl.WindowShouldClose()) {
+        // Update texture
+        texture.Begin();
+        var u: i32 = 0;
+        while (u < screen_width) : (u += 1) {
+            var v: i32 = 0;
+            while (v < screen_height) : (v += 1) {
+                const c = img_buffer[@intCast(usize, u + v * screen_width)];
+                rl.DrawPixel(u, v, c);
+            }
+        }
+        texture.End();
+
         // Draw
         rl.BeginDrawing();
-        rl.ClearBackground(rl.BLACK);
         rl.DrawTexture(texture.texture, 0, 0, rl.WHITE);
         rl.EndDrawing();
+    }
+
+    // Wait for rendering to finish
+    running = false;
+    for (threads) |thread| {
+        thread.join();
     }
 }
