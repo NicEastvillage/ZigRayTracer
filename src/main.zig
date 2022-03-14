@@ -195,25 +195,30 @@ fn rayColor(ray: Ray, spheres: []const Sphere, depth: u32) Vec3 {
 }
 
 /// Renders the scanlines from v0 to v1
-fn renderSection(running: *bool, img_buffer: []Color, v0: i32, v1: i32, spheres: []const Sphere, cam: *const rl.Camera3D) void {
+fn renderSection(running: *bool, reset_flag: *bool, img_buffer: []Color, v0: i32, v1: i32, spheres: []const Sphere, cam: *const rl.Camera3D) void {
     var sample: u32 = 0;
-    while (running.*) : (sample += 1) {
-        var v: i32 = v0;
-        while (v < v1) : (v += 1) {
-            var u: i32 = 0;
-            while (u < screen_width) : (u += 1) {
-                const i = @intCast(usize, u + v * screen_width);
-                const uf = @intToFloat(f32, u);
-                const vf = @intToFloat(f32, screen_height - v - 1);
+    while (running.*) {
+        reset: while (running.* and !reset_flag.*) : (sample += 1) {
+            var v: i32 = v0;
+            while (v < v1) : (v += 1) {
+                var u: i32 = 0;
+                while (u < screen_width) : (u += 1) {
+                    const i = @intCast(usize, u + v * screen_width);
+                    const uf = @intToFloat(f32, u);
+                    const vf = @intToFloat(f32, screen_height - v - 1);
 
-                const du = rng.random().float(f32);
-                const dv = rng.random().float(f32);
-                const ray = rl.GetMouseRay(rl.Vector2{ .x = uf + du, .y = vf + dv }, cam.*);
-                const color = vec3ToColor(rayColor(ray, spheres, max_depth), sample);
+                    const du = rng.random().float(f32);
+                    const dv = rng.random().float(f32);
+                    const ray = rl.GetMouseRay(rl.Vector2{ .x = uf + du, .y = vf + dv }, cam.*);
+                    const color = vec3ToColor(rayColor(ray, spheres, max_depth), sample);
 
-                img_buffer[i] = rl.ColorAlphaBlend(img_buffer[i], color, rl.WHITE);
+                    img_buffer[i] = rl.ColorAlphaBlend(img_buffer[i], color, rl.WHITE);
+                }
             }
+            if (reset_flag.*) break :reset;
         }
+        reset_flag.* = false;
+        sample = 0;
     }
 }
 
@@ -290,40 +295,50 @@ pub fn main() anyerror!void {
         .projection = rl.CameraProjection.CAMERA_PERSPECTIVE,
     };
 
-    const spheres = createSpheres(sphere_count);
+    var spheres = createSpheres(sphere_count);
 
     // Render
     //--------------------------------------------------------------------------------------
-    var img_buffer: [screen_width * screen_height]Color = undefined;
-    const sectionHeight = screen_height / thread_count;
+    var img_buffer: [screen_width * screen_height]Color = [_]Color{rl.BLACK} ** (screen_width * screen_height);
+    const section_height = screen_height / thread_count;
     var threads: [thread_count]Thread = undefined;
-    const renderTimer = try Timer.start();
+    var reset_flags: [thread_count]bool = [_]bool{false} ** thread_count;
+    const render_timer = try Timer.start();
 
     // Start threads - each is tasked with a section of the buffer'
     var running = true;
     var tid: i32 = 0;
     while (tid < thread_count) : (tid += 1) {
-        const v0 = tid * sectionHeight;
-        const v1 = if (tid == thread_count - 1) screen_height else tid * sectionHeight + sectionHeight;
+        const v0 = tid * section_height;
+        const v1 = if (tid == thread_count - 1) screen_height else tid * section_height + section_height;
         print("Thread {} will render v={}..{}\n", .{ tid, v0, v1 });
-        threads[@intCast(usize, tid)] = try Thread.spawn(.{}, renderSection, .{ &running, img_buffer[0..], v0, v1, spheres[0..], &cam });
+        threads[@intCast(usize, tid)] = try Thread.spawn(.{}, renderSection, .{ &running, &reset_flags[@intCast(usize, tid)], img_buffer[0..], v0, v1, spheres[0..], &cam });
     }
 
     // Draw buffer on texture
     var texture = rl.LoadRenderTexture(screen_width, screen_height);
     defer rl.UnloadRenderTexture(texture);
 
-    print("Finished rendering in {d:.3} seconds\n", .{0.000000001 * @intToFloat(f32, renderTimer.read())});
+    print("Finished rendering in {d:.3} seconds\n", .{0.000000001 * @intToFloat(f32, render_timer.read())});
 
     // Main loop
     //--------------------------------------------------------------------------------------
     while (!rl.WindowShouldClose()) {
+        // Reset on mouse click
+        if (rl.IsMouseButtonPressed(rl.MouseButton.MOUSE_LEFT_BUTTON)) {
+            spheres = createSpheres(sphere_count);
+            img_buffer = [_]Color{rl.BLACK} ** (screen_width * screen_height);
+            for (reset_flags) |*flag| {
+                flag.* = true;
+            }
+        }
+
         // Update texture
         texture.Begin();
-        var u: i32 = 0;
-        while (u < screen_width) : (u += 1) {
-            var v: i32 = 0;
-            while (v < screen_height) : (v += 1) {
+        var v: i32 = 0;
+        while (v < screen_height) : (v += 1) {
+            var u: i32 = 0;
+            while (u < screen_width) : (u += 1) {
                 const c = img_buffer[@intCast(usize, u + v * screen_width)];
                 rl.DrawPixel(u, v, c);
             }
