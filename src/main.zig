@@ -10,6 +10,8 @@ const Color = rl.Color;
 const Ray = rl.Ray;
 const RayCollision = rl.RayCollision;
 const Rng = std.rand.DefaultPrng;
+const AtomicOrd = std.builtin.AtomicOrder;
+const AtomicRmwOp = std.builtin.AtomicRmwOp;
 
 // External functions
 const print = std.debug.print;
@@ -37,7 +39,8 @@ const screen_width = 1280;
 const screen_height = 680;
 const sphere_count = 100;
 const max_depth = 5;
-const thread_count = 14;
+const max_thread_count = 14;
+const section_count = 64; // Minimum 2
 const sky_color = Vec3{ .x = 0.4, .y = 0.55, .z = 0.92 };
 const ground_color = Vec3{ .x = 0.8, .y = 0.6, .z = 0.5 };
 
@@ -69,6 +72,15 @@ const Sphere = struct {
     pos: Vec3,
     radius: f32,
     material: Material,
+};
+
+// Threading structures
+//--------------------------------------------------------------------------------------
+
+const SectionJob = struct {
+    v0: i32,
+    v1: i32,
+    passes: i32,
 };
 
 // Utility functions
@@ -222,6 +234,41 @@ fn renderSection(running: *bool, reset_flag: *bool, img_buffer: []Color, v0: i32
     }
 }
 
+fn runWorker(
+    running: *bool,
+    next_section_index: *usize,
+    sections: []SectionJob,
+    img_buffer: []Color,
+    spheres: []const Sphere,
+    cam: *const rl.Camera3D,
+) void {
+    while (running.*) {
+        const current_section_index = @atomicRmw(usize, next_section_index, AtomicRmwOp.Add, 1, AtomicOrd.AcqRel) % section_count;
+
+        // Increase passes in shared memory
+        // Then make local copy of the job
+        sections[current_section_index].passes += 1;
+        const section = sections[current_section_index];
+
+        var v: i32 = section.v0;
+        while (v < section.v1) : (v += 1) {
+            var u: i32 = 0;
+            while (u < screen_width) : (u += 1) {
+                const i = @intCast(usize, u + v * screen_width);
+                const uf = @intToFloat(f32, u);
+                const vf = @intToFloat(f32, screen_height - v - 1);
+
+                const du = rng.random().float(f32);
+                const dv = rng.random().float(f32);
+                const ray = rl.GetMouseRay(rl.Vector2{ .x = uf + du, .y = vf + dv }, cam.*);
+                const color = vec3ToColor(rayColor(ray, spheres, max_depth), @intCast(u32, section.passes));
+
+                img_buffer[i] = rl.ColorAlphaBlend(img_buffer[i], color, rl.WHITE);
+            }
+        }
+    }
+}
+
 // Setup and main
 //--------------------------------------------------------------------------------------
 fn createSpheres(comptime count: usize) [count + 1]Sphere {
@@ -300,26 +347,31 @@ pub fn main() anyerror!void {
     // Render
     //--------------------------------------------------------------------------------------
     var img_buffer: [screen_width * screen_height]Color = [_]Color{rl.BLACK} ** (screen_width * screen_height);
-    const section_height = screen_height / thread_count;
-    var threads: [thread_count]Thread = undefined;
-    var reset_flags: [thread_count]bool = [_]bool{false} ** thread_count;
-    const render_timer = try Timer.start();
+    const section_height = screen_height / section_count;
+    var sections: [section_count]SectionJob = undefined;
+    var sid: i32 = 0;
+    while (sid < section_count) : (sid += 1) {
+        sections[@intCast(usize, sid)] = SectionJob{
+            .v0 = sid * section_height,
+            .v1 = if (sid == section_count - 1) screen_height else sid * section_height + section_height,
+            .passes = -1,
+        };
+    }
 
-    // Start threads - each is tasked with a section of the buffer'
+    const thread_count = @minimum(max_thread_count, section_count - 1);
+    var threads: [thread_count]Thread = undefined;
+
+    // Start threads
     var running = true;
+    var next_section_index: usize = 0;
     var tid: i32 = 0;
     while (tid < thread_count) : (tid += 1) {
-        const v0 = tid * section_height;
-        const v1 = if (tid == thread_count - 1) screen_height else tid * section_height + section_height;
-        print("Thread {} will render v={}..{}\n", .{ tid, v0, v1 });
-        threads[@intCast(usize, tid)] = try Thread.spawn(.{}, renderSection, .{ &running, &reset_flags[@intCast(usize, tid)], img_buffer[0..], v0, v1, spheres[0..], &cam });
+        threads[@intCast(usize, tid)] = try Thread.spawn(.{}, runWorker, .{ &running, &next_section_index, sections[0..], img_buffer[0..], spheres[0..], &cam });
     }
 
     // Draw buffer on texture
     var texture = rl.LoadRenderTexture(screen_width, screen_height);
     defer rl.UnloadRenderTexture(texture);
-
-    print("Finished rendering in {d:.3} seconds\n", .{0.000000001 * @intToFloat(f32, render_timer.read())});
 
     // Main loop
     //--------------------------------------------------------------------------------------
@@ -328,8 +380,8 @@ pub fn main() anyerror!void {
         if (rl.IsMouseButtonPressed(rl.MouseButton.MOUSE_LEFT_BUTTON)) {
             spheres = createSpheres(sphere_count);
             img_buffer = [_]Color{rl.BLACK} ** (screen_width * screen_height);
-            for (reset_flags) |*flag| {
-                flag.* = true;
+            for (sections) |*section| {
+                section.*.passes = -1;
             }
         }
 
